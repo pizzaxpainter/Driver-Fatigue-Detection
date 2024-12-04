@@ -19,7 +19,7 @@ class DriverDrowsinessDataset(Dataset):
     - Masking for valid/invalid frames
     """
 
-    def __init__(self, root_dir, split='train', transform=None, seq_len=16, padding_value=0.0, default_img_size=224):
+    def __init__(self, root_dir, split='train', transform=None, seq_len=16, padding_value=0.0, default_img_size=224, stride=None):
         """
         Initialize dataset with configuration parameters and load data paths.
 
@@ -40,6 +40,7 @@ class DriverDrowsinessDataset(Dataset):
         self.sequences = []  # List to store image paths
         self.labels = []     # List to store corresponding labels
         self.default_size = default_img_size
+        self.stride = stride if stride is not None else seq_len // 2
 
         # Validate split parameter
         if split not in ['train', 'val', 'test']:
@@ -64,8 +65,7 @@ class DriverDrowsinessDataset(Dataset):
                 ])
                 
                 # Create overlapping sequences with 50% stride
-                stride = self.seq_len // 2
-                for i in range(0, len(images), stride):
+                for i in range(0, len(images), self.stride):
                     seq = images[i:i + self.seq_len]
                     if len(seq) == self.seq_len:
                         # Store complete sequences
