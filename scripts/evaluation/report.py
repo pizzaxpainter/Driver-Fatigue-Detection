@@ -2,6 +2,7 @@ from tqdm import tqdm
 from sklearn.metrics import classification_report, confusion_matrix
 import matplotlib.pyplot as plt
 import seaborn as sns
+import torch
 from torch.amp import autocast
 import pandas as pd
 
