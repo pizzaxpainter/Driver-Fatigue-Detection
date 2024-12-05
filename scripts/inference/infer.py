@@ -1,11 +1,84 @@
 import os
 import torch
-from PIL import Image
 from torch.amp import autocast
 from collections import Counter
 import time
 import psutil
 import gc
+from torchvision import transforms
+from torchvision.transforms import Normalize, ToTensor
+from ..utils.helpers import load_model
+from ..utils.settings import get_device
+from ..models.pretrained import VisionTransformer
+from PIL import Image, ImageFilter
+import cv2
+from tqdm import tqdm
+
+
+class ResizePadSharpenTransform:
+    def __init__(self, target_size=(224, 224), mean=None, std=None):
+        """
+        Initialize the transform.
+
+        Args:
+            target_size (tuple): Desired output size as (width, height).
+            mean (list): Mean for normalization.
+            std (list): Standard deviation for normalization.
+        """
+        self.target_size = target_size
+        self.mean = mean if mean is not None else [0.485, 0.456, 0.406]
+        self.std = std if std is not None else [0.229, 0.224, 0.225]
+        self.normalize = Normalize(mean=self.mean, std=self.std)
+        self.to_tensor = ToTensor()
+
+    def __call__(self, image):
+        """
+        Apply the transform to an image.
+
+        Args:
+            image (PIL.Image.Image): Input image.
+
+        Returns:
+            torch.Tensor: Transformed image tensor.
+        """
+        # Convert image to RGB if not already
+        image = image.convert('RGB')
+
+        # Determine the appropriate resampling filter
+        try:
+            # For Pillow >= 10.0.0
+            resample = Image.Resampling.LANCZOS
+        except AttributeError:
+            try:
+                # For Pillow < 10.0.0
+                resample = Image.LANCZOS
+            except AttributeError:
+                # Fallback to BICUBIC if LANCZOS is not available
+                resample = Image.BICUBIC
+
+        # Resize the image while maintaining aspect ratio
+        image.thumbnail(self.target_size, resample)
+
+        # Create a new image with a black background
+        new_img = Image.new("RGB", self.target_size, (0, 0, 0))
+
+        # Calculate padding to center the image
+        paste_x = (self.target_size[0] - image.width) // 2
+        paste_y = (self.target_size[1] - image.height) // 2
+        new_img.paste(image, (paste_x, paste_y))
+
+        # Apply the sharpening filter
+        # You can use SHARPEN or UnsharpMask for more control
+        sharpened_img = new_img.filter(ImageFilter.SHARPEN)
+        # For more control:
+        # sharpened_img = new_img.filter(ImageFilter.UnsharpMask(radius=2, percent=150, threshold=3))
+
+        # Convert to tensor and normalize
+        image_tensor = self.to_tensor(sharpened_img)
+        image_tensor = self.normalize(image_tensor)
+
+        return image_tensor
+
 
 
 class InferencePipeline:
@@ -29,12 +102,12 @@ class InferencePipeline:
         self.classes = classes
         self.model.eval()
 
-    def preprocess_images(self, image_paths):
+    def preprocess_images_from_frames(self, frames):
         """
-        Preprocess a list of image paths into a tensor suitable for the model.
+        Preprocess a list of PIL Image frames into a tensor suitable for the model.
 
         Args:
-            image_paths (list): List of image file paths.
+            frames (list): List of PIL Image frames.
 
         Returns:
             torch.Tensor: Preprocessed image tensor with shape [1, window_size, C, H, W].
@@ -42,15 +115,15 @@ class InferencePipeline:
         """
         images = []
         mask = []
-        for path in image_paths:
-            if path is not None:
+        for frame in frames:
+            if frame is not None:
                 try:
-                    image = Image.open(path).convert("RGB")
+                    image = frame.convert("RGB")
                     image = self.transform(image)
                     images.append(image)
                     mask.append(1)
                 except Exception as e:
-                    print(f"Error processing image {path}: {e}")
+                    print(f"Error processing frame: {e}")
                     continue
             else:
                 # Create a dummy image for padding
@@ -69,30 +142,49 @@ class InferencePipeline:
         mask = torch.tensor(mask, dtype=torch.bool).unsqueeze(0)  # Shape: [1, window_size]
         return images, mask
 
-    def predict(self, image_dir, threshold=0.5):
+    def predict_video(self, video_path, threshold=0.5, frame_skip=1):
         """
-        Perform inference on a sequence of images in a directory.
+        Perform inference on a video file.
 
         Args:
-            image_dir (str): Path to the directory containing the images.
+            video_path (str): Path to the video file.
             threshold (float): Threshold for binary classification.
+            frame_skip (int): Number of frames to skip between processed frames.
 
         Returns:
             str: Predicted label (e.g., "neg" or "pos").
         """
-        # Load and sort images from the directory
-        image_extensions = (".jpg", ".jpeg", ".png", ".bmp", ".tiff")
-        image_paths = sorted(
-            [os.path.join(image_dir, img) for img in os.listdir(image_dir) if img.lower().endswith(image_extensions)]
-        )
+        # Initialize video capture
+        cap = cv2.VideoCapture(video_path)
 
-        if not image_paths:
-            raise ValueError(f"No valid images found in directory {image_dir}.")
+        if not cap.isOpened():
+            raise ValueError(f"Error opening video file {video_path}")
+
+        frames = []
+        frame_count = 0
+
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            if frame_count % frame_skip == 0:
+                # Convert frame to PIL Image
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                image = Image.fromarray(frame)
+                frames.append(image)
+
+            frame_count += 1
+
+        cap.release()
+
+        if not frames:
+            raise ValueError(f"No frames extracted from video {video_path}.")
 
         # Create sliding windows
         windows = []
-        for start_idx in range(0, len(image_paths), self.stride):
-            window = image_paths[start_idx:start_idx + self.window_size]
+        for start_idx in tqdm(range(0, len(frames), self.stride)):
+            window = frames[start_idx:start_idx + self.window_size]
             if len(window) < self.window_size:
                 # Pad the window with None
                 window += [None] * (self.window_size - len(window))
@@ -101,7 +193,7 @@ class InferencePipeline:
         # Batch processing and memory optimization
         predictions = []
         for window in windows:
-            inputs, mask = self.preprocess_images(window)  # [1, window_size, C, H, W], [1, window_size]
+            inputs, mask = self.preprocess_images_from_frames(window)  # [1, window_size, C, H, W], [1, window_size]
             inputs = inputs.to(self.device)
             mask = mask.to(self.device)
 
@@ -119,26 +211,76 @@ class InferencePipeline:
         most_common = Counter(predictions).most_common(1)[0][0]
         return self.classes[most_common]
 
-    def predict_batch(self, image_dirs, threshold=0.5):
+    def predict_webcam(self, threshold=0.5, frame_skip=1):
         """
-        Perform inference on multiple directories of images.
+        Perform inference on live webcam footage.
 
         Args:
-            image_dirs (list): List of paths to directories containing images.
             threshold (float): Threshold for binary classification.
+            frame_skip (int): Number of frames to skip between processed frames.
 
-        Returns:
-            list: Predicted labels for each directory.
         """
-        batch_predictions = []
-        for image_dir in image_dirs:
-            try:
-                label = self.predict(image_dir, threshold)
-                batch_predictions.append(label)
-            except ValueError as e:
-                print(f"Skipping directory {image_dir}: {e}")
-                batch_predictions.append(None)
-        return batch_predictions
+        # Initialize webcam capture
+        cap = cv2.VideoCapture(0)
+
+        if not cap.isOpened():
+            raise ValueError("Error opening webcam")
+
+        frames_buffer = []
+        frame_count = 0
+
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                print("Failed to grab frame")
+                break
+
+            if frame_count % frame_skip == 0:
+                # Convert frame to PIL Image
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                image = Image.fromarray(frame_rgb)
+                frames_buffer.append(image)
+
+                if len(frames_buffer) >= self.window_size:
+                    # Get the latest window_size frames
+                    window = frames_buffer[-self.window_size:]
+
+                    inputs, mask = self.preprocess_images_from_frames(window)
+                    inputs = inputs.to(self.device)
+                    mask = mask.to(self.device)
+
+                    with torch.no_grad():
+                        if "cuda" in self.device.type:
+                            with autocast(self.device.type):
+                                outputs = self.model(inputs, img_mask=mask, seq_mask=mask)  # [1, num_classes]
+                        else:
+                            outputs = self.model(inputs, img_mask=mask, seq_mask=mask)
+
+                        probs = torch.softmax(outputs, dim=1)[:, 1]  # Probability of positive class
+                        prediction = (probs > threshold).long().cpu().item()
+                        label = self.classes[prediction]
+
+                        # Display the prediction on the frame
+                        cv2.putText(frame, f"Prediction: {label}", (10, 30),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+
+                    # Optionally, we can slide the window by stride
+                    if self.stride < self.window_size:
+                        frames_buffer = frames_buffer[self.stride:]
+                    else:
+                        frames_buffer = []
+
+            # Display the frame
+            cv2.imshow('Webcam', frame)
+
+            key = cv2.waitKey(1)
+            if key == 27:  # ESC key to exit
+                break
+
+            frame_count += 1
+
+        cap.release()
+        cv2.destroyAllWindows()
 
 
 def measure_memory_inference(model, input_data, device='cuda'):
@@ -206,3 +348,50 @@ def measure_memory_inference(model, input_data, device='cuda'):
         "gpu_memory_delta_mb": delta_mem_gpu,
         "inference_time_s": inference_time
     }
+
+
+
+if __name__ == "__main__":
+    # Define the device
+    device = get_device()
+
+    # Load the trained model
+    model = VisionTransformer(
+        num_classes=2,
+        model_name='vit_base_patch16_224',
+        use_temporal_modeling=True,
+        temporal_hidden_size=512,
+        dropout_p=0.5,
+        rnn_num_layers=2,
+        bidirectional=False,
+        freeze_vit=True,
+    )
+    model.to(device)
+
+    # Load the model weights
+    fpath = os.path.join(os.getcwd(), 'best_model.pth')
+    load_model(model, device, fpath)
+
+    # Define the transformation
+    transform = ResizePadSharpenTransform(
+        target_size=(224, 224),  # Target size as (width, height)
+        mean=[0.485, 0.456, 0.406],  # Mean for normalization
+        std=[0.229, 0.224, 0.225]    # Std for normalization
+    )
+
+    # Initialize the inference pipeline
+    pipeline = InferencePipeline(
+        model=model,
+        device=device,
+        transform=transform,
+        window_size=16,
+        stride=8,
+        classes=['non-drowsy', 'drowsy']
+    )
+
+    # # Perform prediction on a video file
+    # video_prediction = pipeline.predict_video("test.mp4", threshold=0.5, frame_skip=1)
+    # print(f"Predicted label for video: {video_prediction}")
+
+    # Perform real-time prediction using webcam
+    pipeline.predict_webcam(threshold=0.5, frame_skip=1)
