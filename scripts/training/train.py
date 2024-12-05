@@ -219,7 +219,6 @@ def train(
     
     for epoch in range(1, num_epochs + 1):
         start_time = time.time()
-        memory_start = torch.cuda.memory_allocated(device) / 1e6 if device.type == "cuda" else 0.0
 
         # Training Phase
         train_loss, train_acc, train_f1, lr_list = train_one_epoch(
@@ -248,8 +247,7 @@ def train(
 
         # Calculate epoch time and GPU memory usage
         epoch_time = time.time() - start_time
-        memory_end = torch.cuda.memory_allocated(device) / 1e6 if device.type == "cuda" else 0.0
-        memory_usage = memory_end - memory_start
+        memory_usage = torch.cuda.memory_allocated(device) / (1024 ** 2) if device.type == "cuda" else 0.0
 
         # Store metrics
         history["epoch"].append(epoch)
