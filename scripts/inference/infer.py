@@ -7,13 +7,21 @@ import psutil
 import gc
 from torchvision import transforms
 from torchvision.transforms import Normalize, ToTensor
-from ..utils.helpers import load_model
-from ..utils.settings import get_device
-from ..models.pretrained import VisionTransformer
+#from ..utils.helpers import load_model
+#from ..utils.settings import get_device
+#from ..models.pretrained import VisionTransformer
 from PIL import Image, ImageFilter
 import cv2
 from tqdm import tqdm
 
+import sys
+
+# Add project path to import custom modules
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+from models.pretrained import VisionTransformer
+from utils.helpers import load_model
+from utils.settings import get_device
 
 class ResizePadSharpenTransform:
     def __init__(self, target_size=(224, 224), mean=None, std=None):
