@@ -10,13 +10,34 @@ import copy
 import pandas as pd
 import gc
 
+import torch
+from sklearn.metrics import f1_score
+from tqdm import tqdm
+
 def train_one_epoch(
     model, train_loader, criterion, optimizer, device, scaler,
     adversary=None, max_grad_norm=1.0
 ):
+    """
+    Trains the model for one epoch, optionally using adversarial training.
+
+    Args:
+        model (nn.Module): The neural network model.
+        train_loader (DataLoader): DataLoader for training data.
+        criterion (nn.Module): Loss function.
+        optimizer (torch.optim.Optimizer): Optimizer.
+        device (torch.device): Device to train on.
+        scaler (GradScaler): Gradient scaler for mixed precision.
+        adversary (AdversarialAttack, optional): Adversary for adversarial training.
+        max_grad_norm (float, optional): Maximum gradient norm for clipping. Defaults to 1.0.
+
+    Returns:
+        tuple: (epoch_loss, epoch_accuracy, epoch_f1, lr_list)
+    """
     model.train()
     running_loss = 0.0
-    correct = total = 0
+    correct = 0
+    total = 0
     all_preds, all_labels = [], []
     lr_list = []
 
@@ -29,45 +50,66 @@ def train_one_epoch(
             optimizer.zero_grad()
 
             # Standard forward pass
-            with autocast(device.type):
+            if scaler is not None:
+                with torch.amp.autocast(device.type):
+                    batch_outputs = model(batch_inputs, img_mask=batch_masks, seq_mask=batch_masks)
+                    loss = criterion(batch_outputs, batch_labels)
+            else:
                 batch_outputs = model(batch_inputs, img_mask=batch_masks, seq_mask=batch_masks)
                 loss = criterion(batch_outputs, batch_labels)
 
             # Adversarial training
             if adversary is not None:
                 if adversary.attack_type == 'awp':
-                    # Get adversarial loss from AWP attack
-                    loss_adv = adversary.generate(batch_inputs, batch_labels, batch_masks)
+                    # Perform AWP attack by passing batch_loss
+                    loss_adv = adversary.generate(batch_loss=loss)
                     # Combine losses
                     total_loss = (loss + loss_adv) / 2
                 else:
                     # Generate adversarial examples for input attacks
-                    batch_inputs_adv = adversary.generate(batch_inputs, batch_labels, batch_masks)
+                    batch_inputs_adv = adversary.generate(inputs=batch_inputs, labels=batch_labels, masks=batch_masks)
                     batch_inputs_adv = batch_inputs_adv.to(device)
 
                     # Forward pass with adversarial examples
-                    with autocast(device.type):
+                    if scaler is not None:
+                        with torch.amp.autocast(device.type):
+                            batch_outputs_adv = model(batch_inputs_adv, img_mask=batch_masks, seq_mask=batch_masks)
+                            loss_adv = criterion(batch_outputs_adv, batch_labels)
+                    else:
                         batch_outputs_adv = model(batch_inputs_adv, img_mask=batch_masks, seq_mask=batch_masks)
                         loss_adv = criterion(batch_outputs_adv, batch_labels)
 
                     # Combine losses
                     total_loss = (loss + loss_adv) / 2
-            else:
-                total_loss = loss
 
-            # Backpropagation
-            scaler.scale(total_loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-            scaler.step(optimizer)
-            scaler.update()
+                # Backpropagation with adversarial loss
+                if scaler is not None:
+                    scaler.scale(total_loss).backward()
+                else:
+                    total_loss.backward()
+            else:
+                # Backpropagation with standard loss
+                if scaler is not None:
+                    scaler.scale(loss).backward()
+                else:
+                    loss.backward()
+
+            # Gradient clipping and optimizer step
+            if scaler is not None:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                optimizer.step()
 
             # Record learning rate
             current_lr = optimizer.param_groups[0]['lr']
             lr_list.append(current_lr)
 
             # Update metrics
-            running_loss += total_loss.item() * batch_inputs.size(0)
+            running_loss += (total_loss.item() if adversary else loss.item()) * batch_inputs.size(0)
             _, batch_preds = torch.max(batch_outputs, 1)
             correct += (batch_preds == batch_labels).sum().item()
             total += batch_labels.size(0)
@@ -107,28 +149,34 @@ def evaluate(model, data_loader, criterion, device, classes=['neg', 'pos'], mode
     all_labels = []
     
     with torch.no_grad():
-        for inputs, masks, labels in tqdm(data_loader, desc=f"{mode} Evaluation", leave=True):
-            inputs = inputs.to(device, non_blocking=True)
-            masks = masks.to(device, non_blocking=True)
-            labels = labels.to(device, non_blocking=True)
-            
-            # Mixed precision inference
-            if "cuda" in device.type:
-                with autocast(device.type):
+        with tqdm(data_loader, desc=f"{mode} Evaluation", leave=True) as pbar:
+            for inputs, masks, labels in pbar:
+                inputs = inputs.to(device, non_blocking=True)
+                masks = masks.to(device, non_blocking=True)
+                labels = labels.to(device, non_blocking=True)
+                
+                # Mixed precision inference
+                if "cuda" in device.type and torch.cuda.is_available():
+                    with torch.amp.autocast(device.type):
+                        outputs = model(inputs, img_mask=masks, seq_mask=masks)
+                        loss = criterion(outputs, labels)
+                else:
                     outputs = model(inputs, img_mask=masks, seq_mask=masks)
                     loss = criterion(outputs, labels)
-            else:
-                outputs = model(inputs, img_mask=masks, seq_mask=masks)
-                loss = criterion(outputs, labels)
-            
-            running_loss += loss.item() * inputs.size(0)
-            _, preds = torch.max(outputs, 1)
-            correct += (preds == labels).sum().item()
-            total += labels.size(0)
-            
-            all_preds.extend(preds.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
-    
+                
+                running_loss += loss.item() * inputs.size(0)
+                _, preds = torch.max(outputs, 1)
+                correct += (preds == labels).sum().item()
+                total += labels.size(0)
+                
+                all_preds.extend(preds.cpu().numpy())
+                all_labels.extend(labels.cpu().numpy())
+
+                if total > 0:
+                    batch_f1 = f1_score(all_labels, all_preds, average="macro")
+                    batch_accuracy = 100 * correct / total
+                    pbar.set_postfix({'Loss': f"{running_loss/total:.4f}", 'F1': f"{batch_f1:.4f}", 'Acc': f"{batch_accuracy:.2f}"})
+
     # Final metrics
     avg_loss = running_loss / total
     accuracy = 100 * correct / total
@@ -147,7 +195,8 @@ def evaluate(model, data_loader, criterion, device, classes=['neg', 'pos'], mode
     plt.xlabel('Predicted')
     plt.ylabel('True')
     plt.title(f'Confusion Matrix ({mode})')
-    plt.show()
+    plt.savefig(f'confusion_matrix_{mode}.png')  # Save the figure instead of showing
+    plt.close()  # Close the figure to free memory
     
     return {
         'loss': avg_loss,
@@ -192,7 +241,7 @@ def train(
         pd.DataFrame: DataFrame containing training history.
     """
     os.makedirs(checkpoint_dir, exist_ok=True)
-    scaler = GradScaler() if device.type == 'cuda' else None
+    scaler = torch.amp.GradScaler() if device.type == 'cuda' and torch.cuda.is_available() else None
 
     history = {
         "epoch": [],
@@ -207,14 +256,14 @@ def train(
         "test_f1": [],
         "epoch_time": [],
         "gpu_memory_MB": [],
-        "learning_rates": [],  # Add this line to store learning rates
+        "learning_rates": [],  # Store learning rates
     }
     
     best_val_loss = float('inf')
     best_model_wts = copy.deepcopy(model.state_dict())
     epochs_no_improve = 0
 
-    if device.type == 'cuda':
+    if device.type == 'cuda' and torch.cuda.is_available():
         torch.backends.cudnn.benchmark = True
     
     for epoch in range(1, num_epochs + 1):
@@ -223,11 +272,16 @@ def train(
         # Training Phase
         train_loss, train_acc, train_f1, lr_list = train_one_epoch(
             model, train_loader, criterion, optimizer, device, scaler,
-            adversary=adversary  # Pass the adversary
+            adversary=adversary,  # Pass the adversary
+            max_grad_norm=1.0
         )
 
-        # Store the learning rates from this epoch
-        history["learning_rates"].append(lr_list[0])  # Collect the first learning rate
+        # Store the average learning rate from this epoch
+        if lr_list:
+            avg_lr = sum(lr_list) / len(lr_list)
+            history["learning_rates"].append(avg_lr)
+        else:
+            history["learning_rates"].append(optimizer.param_groups[0]['lr'])
 
         # Validation Phase
         val_metrics = evaluate(
@@ -247,7 +301,7 @@ def train(
 
         # Calculate epoch time and GPU memory usage
         epoch_time = time.time() - start_time
-        memory_usage = torch.cuda.memory_allocated(device) / (1024 ** 2) if device.type == "cuda" else 0.0
+        memory_usage = torch.cuda.memory_allocated(device) / (1024 ** 2) if device.type == "cuda" and torch.cuda.is_available() else 0.0
 
         # Store metrics
         history["epoch"].append(epoch)
@@ -305,7 +359,8 @@ def train(
 
         # Cleanup
         gc.collect()
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     # Load best model weights
     model.load_state_dict(best_model_wts)
