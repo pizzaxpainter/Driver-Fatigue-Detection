@@ -16,7 +16,7 @@ import sys
 # Add project path to import custom modules
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from models.pretrained import VisionTransformer
+from models.pretrained import VisionTransformerLSTMv1
 from utils.helpers import load_model
 from utils.settings import get_device
 
@@ -240,7 +240,7 @@ if st.session_state.recording:
             st.session_state.frame_buffer.append(frame)
             
             device = get_device()
-            model = VisionTransformer(
+            model = VisionTransformerLSTMv1(
                 num_classes=2,
                 model_name='vit_base_patch16_224',
                 use_temporal_modeling=True,
