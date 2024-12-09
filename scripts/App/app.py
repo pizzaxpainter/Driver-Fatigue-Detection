@@ -195,15 +195,6 @@ class InferencePipeline:
         return self.classes[most_common]        
 
     def predict_webcam(self, threshold=0.5, frame_skip=1, video_placeholder=None, status_placeholder=None):
-        """
-        Perform inference on live webcam footage and display results in Streamlit.
-
-        Args:
-            threshold (float): Threshold for binary classification.
-            frame_skip (int): Number of frames to skip between processed frames.
-            video_placeholder: Streamlit placeholder for displaying video frames.
-            status_placeholder: Streamlit placeholder for displaying the status.
-        """
         # Initialize webcam capture
         cap = cv2.VideoCapture(0)
 
@@ -214,6 +205,9 @@ class InferencePipeline:
 
         frames_buffer = []
         frame_count = 0
+        drowsy_start_time = None
+        drowsy_warning_triggered = False
+        final_warning_triggered = False
 
         while True:
             ret, frame = cap.read()
@@ -249,10 +243,32 @@ class InferencePipeline:
                         probs = torch.softmax(outputs, dim=1)[:, 1]  # Probability of "drowsy"
                         prediction = (probs > threshold).long().cpu().item()
                         label = self.classes[prediction]
+                        
+                        if prediction == 'drowsy':
+                            if drowsy_start_time is None:
+                                drowsy_start_time = time.time()
+                            elapsed_time = time.time() - drowsy_start_time
 
-                        # Update status_placeholder
-                        if status_placeholder:
-                            status_placeholder.markdown(f"### Status: **{label.capitalize()}**")
+                            if elapsed_time < 7:
+                                status_placeholder.markdown("### Status: **Drowsy detected. Please stay alert!**")
+                            elif elapsed_time < 11:  # 7 + 4 seconds
+                                if not drowsy_warning_triggered:
+                                    drowsy_warning_triggered = True
+                                status_placeholder.markdown("### Status: **Warning! Drowsy**")
+                            else:
+                                if not final_warning_triggered:
+                                    final_warning_triggered = True
+                                status_placeholder.markdown(
+                                    "## **You have been drowsy for the last 5 seconds. Please consider taking a break!**"
+                                )
+                                video_placeholder.empty()
+                                break
+                        else:
+                            # Reset drowsy tracking if user is non-drowsy
+                            drowsy_start_time = None
+                            drowsy_warning_triggered = False
+                            final_warning_triggered = False
+                            status_placeholder.markdown("### Status: **Non-Drowsy**")
 
             # Display the live video stream in video_placeholder
             if video_placeholder:
@@ -332,41 +348,3 @@ if st.session_state.recording:
         video_placeholder=video_placeholder,
         status_placeholder=status_placeholder
     )
-"""
-    cap = cv2.VideoCapture(0)  # Initialize webcam
-    if not cap.isOpened():
-        st.error("Unable to access the camera. Please check your webcam.")
-    else:
-        while st.session_state.recording:
-            ret, frame = cap.read()
-            if not ret:
-                st.error("Failed to capture frame. Stopping recording.")
-                break
-
-            # Display live stream and store frame in the buffer
-            video_placeholder.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), channels="RGB")
-            st.session_state.frame_buffer.append(frame)
-            
-            if len(st.session_state.frame_buffer) >= 16:
-                # Extract the last 16 frames from the buffer
-                last_frames = list(st.session_state.frame_buffer)[-16:]
-
-                pred = pipeline.predict_from_buffer(last_frames)
-
-                # Display the prediction
-                prediction_label = "Drowsy" if pred == 1 else "Non-Drowsy"
-                status_placeholder.markdown(f"### Status: **{prediction_label}**")
-            # Allow Streamlit to refresh UI
-            time.sleep(0.01)  # Approx. 30 FPS
-
-        cap.release()
-
-# Stop recording: Loop the buffered frames
-if not st.session_state.recording and st.session_state.frame_buffer:
-    while True:
-        for frame in list(st.session_state.frame_buffer):
-            video_placeholder.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), channels="RGB")
-            status_placeholder.markdown("### Status: **Processing**")
-            #images = [Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))]
-            time.sleep(0.03)  # Display at 30 FPS
-"""
