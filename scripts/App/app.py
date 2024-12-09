@@ -194,22 +194,91 @@ class InferencePipeline:
         most_common = Counter(predictions).most_common(1)[0][0]
         return self.classes[most_common]        
 
+    def predict_webcam(self, threshold=0.5, frame_skip=1, video_placeholder=None, status_placeholder=None):
+        """
+        Perform inference on live webcam footage and display results in Streamlit.
+
+        Args:
+            threshold (float): Threshold for binary classification.
+            frame_skip (int): Number of frames to skip between processed frames.
+            video_placeholder: Streamlit placeholder for displaying video frames.
+            status_placeholder: Streamlit placeholder for displaying the status.
+        """
+        # Initialize webcam capture
+        cap = cv2.VideoCapture(0)
+
+        if not cap.isOpened():
+            if status_placeholder:
+                status_placeholder.error("Error accessing the webcam. Please check your camera.")
+            return
+
+        frames_buffer = []
+        frame_count = 0
+
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                if status_placeholder:
+                    status_placeholder.error("Failed to grab frame. Stopping webcam stream.")
+                break
+
+            # Skip frames based on frame_skip
+            if frame_count % frame_skip == 0:
+                # Convert frame to PIL Image and add to buffer
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                image = Image.fromarray(frame_rgb)
+                frames_buffer.append(image)
+
+                # Ensure the buffer has the latest `window_size` frames
+                if len(frames_buffer) > self.window_size:
+                    frames_buffer.pop(0)
+
+                # Perform inference if we have enough frames in the buffer
+                if len(frames_buffer) == self.window_size:
+                    inputs, mask = self.preprocess_images_from_frames(frames_buffer)
+                    inputs = inputs.to(self.device)
+                    mask = mask.to(self.device)
+
+                    with torch.no_grad():
+                        if "cuda" in self.device.type:
+                            with autocast(self.device.type):
+                                outputs = self.model(inputs, img_mask=mask, seq_mask=mask)
+                        else:
+                            outputs = self.model(inputs, img_mask=mask, seq_mask=mask)
+
+                        probs = torch.softmax(outputs, dim=1)[:, 1]  # Probability of "drowsy"
+                        prediction = (probs > threshold).long().cpu().item()
+                        label = self.classes[prediction]
+
+                        # Update status_placeholder
+                        if status_placeholder:
+                            status_placeholder.markdown(f"### Status: **{label.capitalize()}**")
+
+            # Display the live video stream in video_placeholder
+            if video_placeholder:
+                video_placeholder.image(frame_rgb, channels="RGB")
+
+            # Stop loop if ESC key is pressed
+            if cv2.waitKey(1) & 0xFF == 27:  # ESC key
+                break
+
+            frame_count += 1
+
+        cap.release()
+        cv2.destroyAllWindows()
+
 # Function to display a frame in Streamlit
 def display_frame(frame):
     frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     st.image(frame, channels="RGB")
 
 # Initialize Streamlit app
-st.title("Webcam Recorder with Frame Buffer")
+st.title("Drowsiness Detection Demo")
 
 # Button state
 if "recording" not in st.session_state:
     st.session_state.recording = False
 
-# Circular buffer to store the last 128 frames
-FRAME_BUFFER_SIZE = 128
-if "frame_buffer" not in st.session_state:
-    st.session_state.frame_buffer = deque(maxlen=FRAME_BUFFER_SIZE)
 
 # Status display
 status_placeholder = st.empty()
@@ -221,10 +290,49 @@ else:
 # Start/Stop Button
 if st.button("Start/Stop"):
     st.session_state.recording = not st.session_state.recording
+    
+device = get_device()
+model = VisionTransformerLSTMv1(
+    num_classes=2,
+    model_name='vit_base_patch16_224',
+    use_temporal_modeling=True,
+    temporal_hidden_size=512,
+    dropout_p=0.5,
+    rnn_num_layers=2,
+    bidirectional=False,
+    freeze_vit=True,
+)
+model.to(device)
+
+fpath = os.path.join(os.getcwd(), 'best_model.pth')
+load_model(model, device, fpath)
+
+transform = ResizePadSharpenTransform(
+    target_size=(224, 224),  # Target size as (width, height)
+    mean=[0.485, 0.456, 0.406],  # Mean for normalization
+    std=[0.229, 0.224, 0.225]    # Std for normalization
+)
+
+pipeline = InferencePipeline(
+    model=model,
+    device=device,
+    transform=transform,
+    window_size=16,
+    stride=8,
+    classes=['non-drowsy', 'drowsy']
+)
+
 
 # Webcam stream handling
 video_placeholder = st.empty()
 if st.session_state.recording:
+    pipeline.predict_webcam(
+        threshold=0.5,
+        frame_skip=1,
+        video_placeholder=video_placeholder,
+        status_placeholder=status_placeholder
+    )
+"""
     cap = cv2.VideoCapture(0)  # Initialize webcam
     if not cap.isOpened():
         st.error("Unable to access the camera. Please check your webcam.")
@@ -238,37 +346,6 @@ if st.session_state.recording:
             # Display live stream and store frame in the buffer
             video_placeholder.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), channels="RGB")
             st.session_state.frame_buffer.append(frame)
-            
-            device = get_device()
-            model = VisionTransformerLSTMv1(
-                num_classes=2,
-                model_name='vit_base_patch16_224',
-                use_temporal_modeling=True,
-                temporal_hidden_size=512,
-                dropout_p=0.5,
-                rnn_num_layers=2,
-                bidirectional=False,
-                freeze_vit=True,
-            )
-            model.to(device)
-            
-            fpath = os.path.join(os.getcwd(), 'best_model.pth')
-            load_model(model, device, fpath)
-            
-            transform = ResizePadSharpenTransform(
-                target_size=(224, 224),  # Target size as (width, height)
-                mean=[0.485, 0.456, 0.406],  # Mean for normalization
-                std=[0.229, 0.224, 0.225]    # Std for normalization
-            )
-            
-            pipeline = InferencePipeline(
-                model=model,
-                device=device,
-                transform=transform,
-                window_size=16,
-                stride=8,
-                classes=['non-drowsy', 'drowsy']
-            )
             
             if len(st.session_state.frame_buffer) >= 16:
                 # Extract the last 16 frames from the buffer
@@ -292,3 +369,4 @@ if not st.session_state.recording and st.session_state.frame_buffer:
             status_placeholder.markdown("### Status: **Processing**")
             #images = [Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))]
             time.sleep(0.03)  # Display at 30 FPS
+"""

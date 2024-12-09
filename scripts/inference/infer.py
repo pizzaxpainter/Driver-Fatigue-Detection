@@ -7,12 +7,21 @@ import psutil
 import gc
 from torchvision import transforms
 from torchvision.transforms import Normalize, ToTensor
-from ..utils.helpers import load_model
+'''from ..utils.helpers import load_model
 from ..utils.settings import get_device
-from ..models.pretrained import VisionTransformerLSTM
+from ..models.pretrained import VisionTransformerLSTM'''
 from PIL import Image, ImageFilter
 import cv2
 from tqdm import tqdm
+
+import sys
+
+# Add project path to import custom modules
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+from models.pretrained import VisionTransformerLSTMv1 as VisionTransformerLSTM
+from utils.helpers import load_model
+from utils.settings import get_device
 
 
 class ResizePadSharpenTransform:
@@ -263,6 +272,7 @@ class InferencePipeline:
                         # Display the prediction on the frame
                         cv2.putText(frame, f"Prediction: {label}", (10, 30),
                                     cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+                        print (f"Prediction: {label}")
 
                     # Optionally, we can slide the window by stride
                     if self.stride < self.window_size:
@@ -390,8 +400,8 @@ if __name__ == "__main__":
     )
 
     # # Perform prediction on a video file
-    # video_prediction = pipeline.predict_video("test.mp4", threshold=0.5, frame_skip=1)
-    # print(f"Predicted label for video: {video_prediction}")
+    #video_prediction = pipeline.predict_video("test.mp4", threshold=0.5, frame_skip=1)
+    #print(f"Predicted label for video: {video_prediction}")
 
     # Perform real-time prediction using webcam
     pipeline.predict_webcam(threshold=0.5, frame_skip=1)
